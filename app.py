@@ -1,107 +1,69 @@
-import os, time, hashlib, json, requests, schedule, logging
+#!/usr/bin/env python3
+"""
+Site Watcher – Main App
+-------------------------------------------
+Runs the site watcher app.
+"""
+
+import time, hashlib, requests, schedule, logging, signal, sys, datetime
 from bs4 import BeautifulSoup
-from twilio.rest import Client
-from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('site_watcher.log'),
-        logging.StreamHandler()  # Also log to console
-    ]
-)
-logger = logging.getLogger(__name__)
+# Import modules in the pattern style
+from config import SITES, HEALTH_CHECK_MORNING, HEALTH_CHECK_EVENING, REQUEST_TIMEOUT, LOOP_SLEEP_INTERVAL, LOG_FILE_NAME
+from modules.twilio_handler import initialize_twilio
+from modules.notifications import send_startup_message, send_shutdown_message, send_health_check_message, send_keyword_alert_message
+from modules.logger import initialize_logger
 
-# Load environment + config
-load_dotenv()
+# Initialize logger
+logger = initialize_logger(LOG_FILE_NAME)
 
-try:
-    with open("config.json", "r") as f:
-        CONFIG = json.load(f)
-    
-    # Basic config validation
-    if "sites" not in CONFIG:
-        raise ValueError("Config file must contain 'sites' key")
-    
-    if not isinstance(CONFIG["sites"], list):
-        raise ValueError("'sites' must be a list")
-    
-    if len(CONFIG["sites"]) == 0:
-        raise ValueError("No sites configured")
-    
-    logger.info(f"✅ Loaded config with {len(CONFIG['sites'])} site(s)")
-    
-except FileNotFoundError:
-    logger.error("❌ config.json file not found")
-    exit(1)
-except json.JSONDecodeError as e:
-    logger.error(f"❌ Invalid JSON in config.json: {str(e)}")
-    exit(1)
-except ValueError as e:
-    logger.error(f"❌ Config validation error: {str(e)}")
-    exit(1)
-except Exception as e:
-    logger.error(f"💥 Unexpected error loading config: {str(e)}")
-    exit(1)
-
-# Twilio setup with error handling
-try:
-    twilio_sid = os.getenv("TWILIO_SID")
-    twilio_token = os.getenv("TWILIO_TOKEN")
-    TO_PHONE = os.getenv("TO_PHONE")
-    FROM_PHONE = os.getenv("FROM_PHONE")
-    
-    if not all([twilio_sid, twilio_token, TO_PHONE, FROM_PHONE]):
-        missing = []
-        if not twilio_sid: missing.append("TWILIO_SID")
-        if not twilio_token: missing.append("TWILIO_TOKEN")
-        if not TO_PHONE: missing.append("TO_PHONE")
-        if not FROM_PHONE: missing.append("FROM_PHONE")
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-    
-    client = Client(twilio_sid, twilio_token)
-    logger.info("✅ Twilio client initialized successfully")
-    
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Twilio client: {str(e)}")
-    exit(1)
+# Initialize Twilio
+TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE = initialize_twilio()
 
 # Memory of last seen content
-last_hashes = {}
+LAST_HASHES = {}
+
+# Track keyword matches and scans
+STATS = {
+    "total_matches": 0,
+    "total_scans": 0,
+    "last_reset": time.time()
+}
 
 # Helper function to scan a site for keywords
 def scan_site(url, keywords):
     """Fetch page, look for keywords, alert on new matches."""
     logger.info(f"Scanning {url} ...")
+    STATS["total_scans"] += 1
     
     try:
         # Make HTTP request with timeout
-        res = requests.get(url, timeout=15)
+        res = requests.get(url, timeout=REQUEST_TIMEOUT)
         res.raise_for_status()
         
         # Parse HTML content
         text = BeautifulSoup(res.text, "html.parser").get_text().lower()
         
-        if any(k.lower() in text for k in keywords):
+        # Check which keywords were found
+        found_keywords = [k for k in keywords if k.lower() in text]
+        
+        if found_keywords:
             page_hash = hashlib.sha256(text.encode()).hexdigest()
-            if last_hashes.get(url) != page_hash:
-                last_hashes[url] = page_hash
-                msg = f"Keyword match found on {url}"
+            if LAST_HASHES.get(url) != page_hash:
+                LAST_HASHES[url] = page_hash
+                keywords_str = ", ".join(found_keywords)
                 
-                try:
-                    client.messages.create(body=msg, from_=FROM_PHONE, to=TO_PHONE)
-                    logger.info(f"✅ Alert sent: {msg}")
-                except Exception as sms_error:
-                    logger.error(f"📱 Failed to send SMS alert for {url}: {str(sms_error)}")
+                STATS["total_matches"] += 1
+                
+                # Send keyword alert
+                send_keyword_alert_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, url, keywords_str)
             else:
                 logger.debug("No new content since last check.")
         else:
             logger.debug("No keyword matches found.")
             
     except requests.exceptions.Timeout:
-        logger.error(f"⏰ Timeout while fetching {url} (15s limit exceeded)")
+        logger.error(f"⏰ Timeout while fetching {url} ({REQUEST_TIMEOUT}s limit exceeded)")
     except requests.exceptions.ConnectionError:
         logger.error(f"🌐 Connection error while fetching {url} (site may be down)")
     except requests.exceptions.HTTPError as e:
@@ -111,20 +73,58 @@ def scan_site(url, keywords):
     except Exception as e:
         logger.error(f"💥 Unexpected error while processing {url}: {str(e)}")
 
+
+def send_health_check_notification():
+    """Send health check notification."""
+    send_health_check_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, STATS, SITES, reset_stats=True)
+
+
 # Register jobs from config
 def register_jobs():
     """Read config and register each site's schedule."""
-    for site in CONFIG["sites"]:
+    for site in SITES:
+        name = site["name"]
         url = site["url"]
-        kws = site["keywords"]
-        hours = site.get("interval_hours", 1)
-        schedule.every(hours).hours.do(scan_site, url, kws)
-        logger.info(f"⏰ Registered {url} every {hours}h for {kws}")
+        keywords = site["keywords"]
+        interval_hours = site.get("interval_hours", 1)
+        schedule.every(interval_hours).hours.do(scan_site, url, keywords)
+        logger.info(f"⏰ Registered {name} ({url}) every {interval_hours}h for {keywords}")
+
+     # Schedule health checks twice a day (morning and evening)
+    schedule.every().day.at(HEALTH_CHECK_MORNING).do(send_health_check_notification)
+    schedule.every().day.at(HEALTH_CHECK_EVENING).do(send_health_check_notification)
+
+    logger.info(f"📊 Health checks scheduled for {HEALTH_CHECK_MORNING} and {HEALTH_CHECK_EVENING} daily")
+
+
+# Signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully."""
+    logger.info("Received shutdown signal, shutting down gracefully...")
+    send_shutdown_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, STATS)
+    sys.exit(0)
+
 
 # Main loop
 if __name__ == "__main__":
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Terminate signal
+    
     register_jobs()
     logger.info("Announcement scanner running...")
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    
+    # Send startup notification
+    send_startup_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, SITES, HEALTH_CHECK_MORNING, HEALTH_CHECK_EVENING)
+    
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(LOOP_SLEEP_INTERVAL)
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
+        send_shutdown_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, STATS)
+    except Exception as e:
+        logger.error(f"💥 Fatal error: {str(e)}")
+        send_shutdown_message(TWILIO_CLIENT, TWILIO_FROM_PHONE, TWILIO_TO_PHONE, STATS)
+        sys.exit(1)
